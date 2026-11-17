@@ -17,7 +17,8 @@
  *   6. Pronóstico a h pasos: X(t+h) = c + phi * X(t+h-1)  -> tiende a
  *      la media del proceso mu = c / (1 - phi) si |phi| < 1.
  *
- * El modelo se re-estima en cada muestra (ventana móvil de N valores).
+ * El primer ajuste se hace al completar un ciclo de 24 h (288 muestras); después
+ * el modelo se re-estima en cada muestra (ventana móvil de las últimas 24 h).
  * Al arrancar se recargan los últimos N registros de /datos_clima.csv.
  *
  * PANTALLAS (pulsador en PIN_BOTON contra GND):
@@ -98,11 +99,13 @@ esp_now_peer_info_t peerInfo;
 #define INTERVALO_MIN    5
 #define MUESTRAS_DIA     (24 * 60 / INTERVALO_MIN)     // 288 muestras = 24 h
 // N_VALORES     : valores en memoria por variable = ventana de ajuste (24 h).
-// N_MIN_AJUSTE  : valores mínimos para estimar el AR(1) (12 = 1 h).
+// N_MIN_AJUSTE  : valores mínimos para estimar el AR(1). Se espera un ciclo
+//                 completo de 24 h (288 muestras) antes de estimar el modelo y
+//                 empezar a pronosticar el siguiente ciclo.
 // MAX_HUECO_MUESTRAS: huecos <= este número de muestras se rellenan con el
 //                 último valor; si son mayores se reinicia la serie.
 #define N_VALORES          MUESTRAS_DIA
-#define N_MIN_AJUSTE       12
+#define N_MIN_AJUSTE       MUESTRAS_DIA                // 288 muestras = 24 h
 #define MAX_HUECO_MUESTRAS 3                           // 15 min
 #define PRECARGAR_SD       true
 
@@ -361,6 +364,13 @@ int pantalla = 0;
 bool redibujar = true;
 unsigned long ultimoBotonMs = 0;
 
+// Minutos que faltan para completar N_MIN_AJUSTE muestras, como "23h55m"
+void fmtFaltan(char* out, size_t len, int muestrasEnMemoria) {
+  int minutos = (N_MIN_AJUSTE - muestrasEnMemoria) * INTERVALO_MIN;
+  if (minutos < 0) minutos = 0;
+  snprintf(out, len, "%dh%02dm", minutos / 60, minutos % 60);
+}
+
 void fmt(char* out, size_t len, float v, int dec) {
   if (isnan(v) || isinf(v)) snprintf(out, len, "--");
   else snprintf(out, len, "%.*f", dec, v);
@@ -391,7 +401,11 @@ void dibujarPrincipal(const RtcDateTime& now, float temperatura, float humedad) 
 
   display.setCursor(0, 41);
   if (arT.ok && arH.ok) display.printf("AR1  T:%.1fC H:%.0f%%", arT.predSig, arH.predSig);
-  else display.printf("AR1: faltan %d min", (N_MIN_AJUSTE - arT.serie.count) * INTERVALO_MIN);
+  else {
+    char f[12];
+    fmtFaltan(f, sizeof(f), arT.serie.count);
+    display.printf("AR1: faltan %s", f);
+  }
 
   display.setCursor(0, 54);
   display.print(sdOK ? "SD:OK" : "SD:ERR");
@@ -404,7 +418,11 @@ void dibujarModelo(const ModeloAR1& m) {
   display.setCursor(0, 0);
   display.printf("AR(1) %s\n", m.nombre);
   if (!m.ok) {
-    if (m.serie.count < N_MIN_AJUSTE) display.printf("\nFaltan %d min\n", (N_MIN_AJUSTE - m.serie.count) * INTERVALO_MIN);
+    if (m.serie.count < N_MIN_AJUSTE) {
+      char f[12];
+      fmtFaltan(f, sizeof(f), m.serie.count);
+      display.printf("\nCiclo de 24h: faltan\n%s\n", f);
+    }
     else display.println("\nSxx = 0 (serie\nconstante)");
     display.printf("\nHist: %d/%d", m.serie.count, N_VALORES);
     return;

@@ -25,7 +25,8 @@
  *   5. Métricas de AJUSTE (residuales CSS en la ventana) y FUERA DE MUESTRA a
  *      1 paso (en cada muestra se compara la lectura nueva con la predicción).
  *
- * El modelo se re-estima cada REAJUSTE_MUESTRAS muestras = 1 h (tarda < 1 s; mientras
+ * El primer ajuste se hace al completar un ciclo de 24 h (288 muestras); después
+ * el modelo se re-estima cada REAJUSTE_MUESTRAS muestras = 1 h (tarda < 1 s; mientras
  * tanto la pantalla muestra "Estimando...").
  *
  * PANTALLAS (pulsador en PIN_BOTON contra GND):
@@ -106,14 +107,16 @@ esp_now_peer_info_t peerInfo;
 #define INTERVALO_MIN    5
 #define MUESTRAS_DIA     (24 * 60 / INTERVALO_MIN)     // 288 muestras = 24 h
 // N_VALORES     : valores en memoria por variable = ventana de ajuste (24 h).
-// N_MIN_AJUSTE  : valores mínimos para el primer ajuste (24 = 2 h).
+// N_MIN_AJUSTE  : valores mínimos para el primer ajuste. Se espera un ciclo
+//                 completo de 24 h (288 muestras) antes de estimar el modelo y
+//                 empezar a pronosticar el siguiente ciclo.
 // REAJUSTE_MUESTRAS: cada cuántas muestras se re-estima el modelo (12 = 1 h).
 // Q_MAX         : orden máximo evaluado (cuaderno: 5).
 // M_AR_HR       : orden del AR largo de Hannan-Rissanen (valores iniciales).
 // MAX_HUECO_MUESTRAS: huecos <= este número de muestras se rellenan con el
 //                 último valor; si son mayores se reinicia la serie.
 #define N_VALORES          MUESTRAS_DIA
-#define N_MIN_AJUSTE       24
+#define N_MIN_AJUSTE       MUESTRAS_DIA                // 288 muestras = 24 h
 #define REAJUSTE_MUESTRAS  12
 #define Q_MAX              5
 #define M_AR_HR            10
@@ -627,6 +630,13 @@ int pantalla = 0;
 bool redibujar = true;
 unsigned long ultimoBotonMs = 0;
 
+// Minutos que faltan para completar N_MIN_AJUSTE muestras, como "23h55m"
+void fmtFaltan(char* out, size_t len, int muestrasEnMemoria) {
+  int minutos = (N_MIN_AJUSTE - muestrasEnMemoria) * INTERVALO_MIN;
+  if (minutos < 0) minutos = 0;
+  snprintf(out, len, "%dh%02dm", minutos / 60, minutos % 60);
+}
+
 void fmt(char* out, size_t len, float v, int dec) {
   if (isnan(v) || isinf(v)) snprintf(out, len, "--");
   else snprintf(out, len, "%.*f", dec, v);
@@ -657,7 +667,11 @@ void dibujarPrincipal(const RtcDateTime& now, float temperatura, float humedad) 
 
   display.setCursor(0, 41);
   if (maT.ok && maH.ok) display.printf("MA   T:%.1fC H:%.0f%%", maT.predSig, maH.predSig);
-  else display.printf("MA: faltan %d min", (N_MIN_AJUSTE - maT.serie.count) * INTERVALO_MIN);
+  else {
+    char f[12];
+    fmtFaltan(f, sizeof(f), maT.serie.count);
+    display.printf("MA: faltan %s", f);
+  }
 
   display.setCursor(0, 54);
   display.print(sdOK ? "SD:OK" : "SD:ERR");
@@ -670,7 +684,9 @@ void dibujarModelo(const ModeloMA& m) {
   display.setCursor(0, 0);
   if (!m.ok) {
     display.printf("MA(q) %s\n\n", m.nombre);
-    display.printf("Faltan %d min\n", (N_MIN_AJUSTE - m.serie.count) * INTERVALO_MIN);
+    char f[12];
+    fmtFaltan(f, sizeof(f), m.serie.count);
+    display.printf("Ciclo de 24h: faltan\n%s\n", f);
     display.printf("\nHist: %d/%d", m.serie.count, N_VALORES);
     return;
   }
