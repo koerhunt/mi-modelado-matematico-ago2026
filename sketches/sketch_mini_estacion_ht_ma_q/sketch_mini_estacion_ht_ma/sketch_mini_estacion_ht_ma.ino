@@ -5,6 +5,10 @@
  *
  *    X(t) = mu + e(t) + theta1 e(t-1) + ... + thetaq e(t-q)
  *
+ * El álgebra lineal se hace con Eigen (biblioteca "ArduinoEigen" de
+ * hideakitai en el Gestor de bibliotecas del IDE de Arduino). Se usa float
+ * (MatrixXf / VectorXf) porque la FPU del ESP32 es de precisión simple.
+ *
  *   1. Se toma una muestra cada INTERVALO_MIN = 5 minutos y se guardan en
  *      memoria los últimos N valores (288 = 24 h).
  *   2. Se ajustan los modelos MA(0) ... MA(Q_MAX) y se elige el orden q con
@@ -13,11 +17,14 @@
  *      En el ESP32 se usa el método equivalente de Suma Condicional de
  *      Cuadrados (CSS), que es como statsmodels arranca su optimización:
  *        a) Valores iniciales por Hannan-Rissanen: se ajusta un AR(m) largo
- *           por mínimos cuadrados, sus residuales estiman las innovaciones
- *           e(t) y luego se regresa X(t) sobre [1, e(t-1) ... e(t-q)].
- *        b) Refinamiento con Gauss-Newton / Levenberg-Marquardt minimizando
- *              SSE = sum e(t)^2,  e(t) = X(t) - mu - sum theta_i e(t-i)
- *      AIC = -2 logL + 2k,  BIC = -2 logL + k ln(n),  k = q + 2 (mu, thetas, sigma2)
+ *           por mínimos cuadrados (QR), sus residuales estiman las
+ *           innovaciones e(t) y luego se regresa X(t) sobre [1, e(t-1) ... e(t-q)].
+ *        b) Refinamiento con Levenberg-Marquardt minimizando
+ *              SSE = ||e||^2,  e(t) = X(t) - mu - sum theta_i e(t-i)
+ *           paso:  (J'J + lambda diag(J'J)) delta = -J'e     (LDLT de Eigen)
+ *      Criterios (cuaderno CRITERIOS_AIC_BIC), verosimilitud gaussiana:
+ *        -2 ln L = n [ln(2 pi SSE/n) + 1]
+ *        AIC = -2 ln L + 2k,  BIC = -2 ln L + k ln(n),  k = q + 2 (mu, thetas, sigma2)
  *   4. Predicción (cuaderno, sección 8):
  *        X(t+h) = mu + sum_{i=h..q} theta_i e(t+h-i)     para h <= q
  *        X(t+h) = mu                                     para h >  q
@@ -26,7 +33,7 @@
  *      1 paso (en cada muestra se compara la lectura nueva con la predicción).
  *
  * El primer ajuste se hace al completar un ciclo de 24 h (288 muestras); después
- * el modelo se re-estima cada REAJUSTE_MUESTRAS muestras = 1 h (tarda < 1 s; mientras
+ * el modelo se re-estima cada REAJUSTE_MUESTRAS muestras = 1 h (mientras
  * tanto la pantalla muestra "Estimando...").
  *
  * PANTALLAS (pulsador en PIN_BOTON contra GND):
@@ -37,8 +44,8 @@
  *   - Sin pulsar durante TIMEOUT_PANTALLA_MS: regresa a la principal.
  */
 
+#include <ArduinoEigenDense.h>   // Eigen: Core, QR, Cholesky
 #include <WiFi.h>
-#include <esp_now.h>
 #include "time.h"
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -49,9 +56,12 @@
 #include <SPI.h>
 #include <SD.h>
 #include <math.h>
-#include <string.h>
 
-// --- 1. DATOS WI-FI ---
+using Eigen::MatrixXf;
+using Eigen::VectorXf;
+using Eigen::VectorXd;
+
+// --- 1. DATOS WI-FI (solo para sincronizar el RTC por NTP) ---
 const char* ssid = "TemakaMB";
 const char* password = "pass1234";
 
@@ -77,21 +87,7 @@ Adafruit_SHT31 sht31 = Adafruit_SHT31();
 #define SD_CS 5 // Pin CS de la MicroSD (SPI: SCK 18, MISO 19, MOSI 23)
 bool sdOK = false;
 
-// --- 5. CONFIGURACIÓN ESP-NOW ---
-typedef struct {
-  uint32_t contador;      // se incrementa en cada envío
-  uint32_t uptime_ms;     // millis() del emisor
-  float    temperatura;   // sensor
-  float    humedad;       // humedad
-  uint32_t heap_libre;    // ESP.getFreeHeap() del emisor
-  uint8_t  estado;        // 0=ok, 1=advertencia, 2=error
-} __attribute__((packed)) Telemetria;
-
-Telemetria datosTelemetria;
-uint8_t macReceptor[] = {0x70, 0x4B, 0xCA, 0x23, 0xB7, 0xBC};
-esp_now_peer_info_t peerInfo;
-
-// --- 6. PULSADOR ---
+// --- 5. PULSADOR ---
 // Pulsador entre PIN_BOTON y GND (se usa la resistencia pull-up interna).
 // Alternativa sin cableado: usar el botón BOOT de la DevKit (GPIO 0).
 #define PIN_BOTON              32
@@ -99,11 +95,11 @@ esp_now_peer_info_t peerInfo;
 #define PULSACION_LARGA_MS     800
 #define TIMEOUT_PANTALLA_MS    60000UL
 
-// --- 7. PARÁMETROS DEL MODELO ---
+// --- 6. PARÁMETROS DEL MODELO ---
 // INTERVALO_MIN : minutos entre muestras del modelo (el sensor se sigue leyendo
-//                 cada 500 ms para la pantalla, pero al modelo, a la SD y a
-//                 ESP-NOW solo entra una muestra cada INTERVALO_MIN minutos,
-//                 alineada al reloj: hh:00, hh:05, hh:10, ...).
+//                 cada 500 ms para la pantalla, pero al modelo y a la SD solo
+//                 entra una muestra cada INTERVALO_MIN minutos, alineada al
+//                 reloj: hh:00, hh:05, hh:10, ...).
 #define INTERVALO_MIN    5
 #define MUESTRAS_DIA     (24 * 60 / INTERVALO_MIN)     // 288 muestras = 24 h
 // N_VALORES     : valores en memoria por variable = ventana de ajuste (24 h).
@@ -128,6 +124,10 @@ esp_now_peer_info_t peerInfo;
 #define GRAF_HIST  96
 #define GRAF_FUT   (SCREEN_WIDTH - GRAF_HIST)
 
+// Declaración adelantada: el IDE de Arduino inserta los prototipos de las
+// funciones antes de la primera función, que está antes de ModeloMA.
+struct ModeloMA;
+
 // ============================================================
 // BUFFER CIRCULAR: últimos N valores
 // ============================================================
@@ -147,6 +147,13 @@ struct Serie {
   // i = 0 -> más antiguo, i = count-1 -> más reciente
   float get(int i) const { return buf[(head - count + i + 2 * N_VALORES) % N_VALORES]; }
   float ultimo()   const { return get(count - 1); }
+
+  // La serie en orden cronológico como vector de Eigen
+  VectorXf vector() const {
+    VectorXf v(count);
+    for (int i = 0; i < count; i++) v(i) = get(i);
+    return v;
+  }
 };
 
 // ============================================================
@@ -179,189 +186,142 @@ struct Metricas {
 };
 
 // ============================================================
-// ESTIMACIÓN MA(q)
+// ÁLGEBRA LINEAL (Eigen)
 // ============================================================
 
-// Declaración adelantada: el IDE de Arduino genera los prototipos de las
-// funciones justo antes de la primera función, que está antes de ModeloMA.
-struct ModeloMA;
+/*
+ * matrizRezagos
+ * -------------
+ * Matriz de diseño con renglones t = inicio .. N-1:
+ *     X = [ 1, v(t-1), v(t-2), ..., v(t-k) ]       (n x (k+1)),  n = N - inicio
+ * La columna i es el vector desplazado i lugares: v.segment(inicio - i, n).
+ */
+MatrixXf matrizRezagos(const VectorXf& v, int k, int inicio) {
+  const int n = v.size() - inicio;
+  MatrixXf X(n, k + 1);
+  X.col(0).setOnes();
+  for (int i = 1; i <= k; i++) X.col(i) = v.segment(inicio - i, n);
+  return X;
+}
 
-// Resuelve A x = b (k x k, fila mayor) por eliminación gaussiana con pivoteo
-// parcial. La solución queda en b. Devuelve false si A es singular.
-bool resolverSistema(double* A, double* b, int k) {
-  for (int col = 0; col < k; col++) {
-    int piv = col;
-    for (int r = col + 1; r < k; r++)
-      if (fabs(A[r * k + col]) > fabs(A[piv * k + col])) piv = r;
-    if (fabs(A[piv * k + col]) < 1e-12) return false;
-    if (piv != col) {
-      for (int c = 0; c < k; c++) { double t = A[col * k + c]; A[col * k + c] = A[piv * k + c]; A[piv * k + c] = t; }
-      double t = b[col]; b[col] = b[piv]; b[piv] = t;
-    }
-    for (int r = col + 1; r < k; r++) {
-      double f = A[r * k + col] / A[col * k + col];
-      for (int c = col; c < k; c++) A[r * k + c] -= f * A[col * k + c];
-      b[r] -= f * b[col];
-    }
-  }
-  for (int r = k - 1; r >= 0; r--) {
-    double s = b[r];
-    for (int c = r + 1; c < k; c++) s -= A[r * k + c] * b[c];
-    b[r] = s / A[r * k + r];
-  }
+/*
+ * minimosCuadrados
+ * ----------------
+ * beta = argmin ||y - X beta||^2 por QR con pivoteo de columnas.
+ * Devuelve false si X no tiene rango completo.
+ */
+bool minimosCuadrados(const MatrixXf& X, const VectorXf& y, VectorXf& beta) {
+  Eigen::ColPivHouseholderQR<MatrixXf> qr(X);
+  if (qr.rank() < X.cols()) return false;
+  beta = qr.solve(y);
   return true;
 }
+
+/*
+ * criteriosInformacion
+ * --------------------
+ * Verosimilitud gaussiana con sigma2 = SSE/n (cuaderno CRITERIOS_AIC_BIC):
+ *   -2 ln L = n [ln(2 pi SSE/n) + 1]
+ *   AIC = -2 ln L + 2k        BIC = -2 ln L + k ln(n)
+ */
+void criteriosInformacion(double sse, int n, int k, double& aic, double& bic) {
+  const double menos2LogL = n * (log(2.0 * M_PI * sse / n) + 1.0);
+  aic = menos2LogL + 2.0 * k;
+  bic = menos2LogL + k * log((double)n);
+}
+
+// ============================================================
+// ESTIMACIÓN MA(q) POR SUMA CONDICIONAL DE CUADRADOS
+// ============================================================
+// Parámetros agrupados en beta = (mu, theta_1, ..., theta_q), tamaño q + 1.
 
 /*
  * residualesCSS
  * -------------
  * e(t) = x(t) - mu - sum theta_i e(t-i), con e(t) = 0 antes del inicio.
- * Devuelve SSE = sum e(t)^2 (INFINITY si la recursión explota: modelo no
- * invertible). Opcionalmente acumula métricas de ajuste y devuelve las
- * últimas q innovaciones (epsFinal[0] = e(t) más reciente).
- */
-double residualesCSS(const float* x, int n, int q, double mu, const double* th,
-                     Metricas* met = nullptr, float* epsFinal = nullptr) {
-  float e[Q_MAX] = {0};          // e[0] = e(t-1), e[1] = e(t-2), ...
-  float thf[Q_MAX];
-  for (int i = 0; i < q; i++) thf[i] = (float)th[i];
-  const float muf = (float)mu;
-  double sse = 0;
-  for (int t = 0; t < n; t++) {
-    float pred = muf;
-    for (int i = 0; i < q; i++) pred += thf[i] * e[i];
-    float et = x[t] - pred;
-    if (!isfinite(et) || fabsf(et) > 1e6f) return INFINITY;
-    sse += (double)et * et;
-    if (met) met->agregar(x[t], pred);
-    for (int i = q - 1; i > 0; i--) e[i] = e[i - 1];
-    if (q > 0) e[0] = et;
-  }
-  if (epsFinal) for (int i = 0; i < Q_MAX; i++) epsFinal[i] = (i < q) ? e[i] : 0.0f;
-  return sse;
-}
-
-/*
- * residualesARLargo (Hannan-Rissanen, paso 1)
- * Ajusta X(t) = a0 + a1 X(t-1) + ... + am X(t-m) por mínimos cuadrados y
- * guarda los residuales en ehat (ehat[t] = 0 para t < m).
- */
-bool residualesARLargo(const float* x, int n, int m, float* ehat) {
-  const int k = m + 1;
-  double A[(M_AR_HR + 1) * (M_AR_HR + 1)] = {0}, b[M_AR_HR + 1] = {0};
-  double fila[M_AR_HR + 1];
-  for (int t = m; t < n; t++) {
-    fila[0] = 1.0;
-    for (int j = 1; j <= m; j++) fila[j] = x[t - j];
-    for (int r = 0; r < k; r++) {
-      b[r] += fila[r] * x[t];
-      for (int c = 0; c < k; c++) A[r * k + c] += fila[r] * fila[c];
-    }
-  }
-  if (!resolverSistema(A, b, k)) return false;
-  for (int t = 0; t < n; t++) {
-    if (t < m) { ehat[t] = 0; continue; }
-    double p = b[0];
-    for (int j = 1; j <= m; j++) p += b[j] * x[t - j];
-    ehat[t] = (float)(x[t] - p);
-  }
-  return true;
-}
-
-/*
- * valoresInicialesHR (Hannan-Rissanen, paso 2)
- * Regresa X(t) sobre [1, ehat(t-1) ... ehat(t-q)].
- */
-bool valoresInicialesHR(const float* x, const float* ehat, int n, int q, int m,
-                        double& mu, double* th) {
-  const int k = q + 1;
-  double A[(Q_MAX + 1) * (Q_MAX + 1)] = {0}, b[Q_MAX + 1] = {0};
-  double fila[Q_MAX + 1];
-  for (int t = m + q; t < n; t++) {
-    fila[0] = 1.0;
-    for (int j = 1; j <= q; j++) fila[j] = ehat[t - j];
-    for (int r = 0; r < k; r++) {
-      b[r] += fila[r] * x[t];
-      for (int c = 0; c < k; c++) A[r * k + c] += fila[r] * fila[c];
-    }
-  }
-  if (!resolverSistema(A, b, k)) return false;
-  mu = b[0];
-  for (int i = 0; i < q; i++) th[i] = b[i + 1];
-  return true;
-}
-
-/*
- * ajustarCSS
- * ----------
- * Levenberg-Marquardt sobre beta = (mu, theta1..thetaq). Las derivadas de
- * e(t) se obtienen con la misma recursión del modelo:
+ * Si J != nullptr calcula también el jacobiano J(t, :) = de(t)/dbeta con la
+ * misma recursión del modelo:
  *   de(t)/dmu      = -1      - sum theta_i de(t-i)/dmu
  *   de(t)/dtheta_j = -e(t-j) - sum theta_i de(t-i)/dtheta_j
+ * Devuelve false si la recursión explota (modelo no invertible).
  */
-double ajustarCSS(const float* x, int n, int q, double& mu, double* th) {
-  const int k = q + 1;
-  double sse = residualesCSS(x, n, q, mu, th);
-  if (!isfinite(sse)) return sse;
-  double lambda = 1e-3;
+bool residualesCSS(const VectorXf& x, const VectorXf& beta, VectorXf& e, MatrixXf* J) {
+  const int n = x.size(), q = beta.size() - 1;
+  e.setZero(n);
+  if (J) J->setZero(n, q + 1);
+
+  for (int t = 0; t < n; t++) {
+    const int r = min(q, t);                       // rezagos disponibles
+    // e(t-1), ..., e(t-r) son e.segment(t-r, r) en orden inverso
+    float pred = beta(0) + beta.segment(1, r).dot(e.segment(t - r, r).reverse());
+    e(t) = x(t) - pred;
+    if (!isfinite(e(t)) || fabsf(e(t)) > 1e6f) return false;
+
+    if (J) {
+      J->operator()(t, 0) = -1.0f;
+      for (int j = 1; j <= r; j++) J->operator()(t, j) = -e(t - j);
+      for (int i = 1; i <= r; i++) J->row(t) -= beta(i) * J->row(t - i);
+    }
+  }
+  return true;
+}
+
+// SSE = ||e||^2 (INFINITY si el modelo no es invertible)
+float sseCSS(const VectorXf& x, const VectorXf& beta) {
+  VectorXf e;
+  return residualesCSS(x, beta, e, nullptr) ? e.squaredNorm() : INFINITY;
+}
+
+/*
+ * valoresInicialesHR (Hannan-Rissanen)
+ * ------------------------------------
+ * ehat son los residuales de un AR(m) largo. Se regresa x(t) sobre
+ * [1, ehat(t-1) ... ehat(t-q)] con t = m+q .. n-1  ->  beta = (mu, theta).
+ */
+bool valoresInicialesHR(const VectorXf& x, const VectorXf& ehat, int q, int m, VectorXf& beta) {
+  const MatrixXf X = matrizRezagos(ehat, q, m + q);
+  return minimosCuadrados(X, x.tail(X.rows()), beta);
+}
+
+/*
+ * ajustarCSS (Levenberg-Marquardt)
+ * --------------------------------
+ * Minimiza SSE(beta). En cada iteración resuelve
+ *     (J'J + lambda diag(J'J)) delta = -J'e
+ * y acepta el paso si reduce el SSE; si no, aumenta lambda.
+ * Devuelve el SSE final (INFINITY si el punto inicial no es invertible).
+ */
+float ajustarCSS(const VectorXf& x, VectorXf& beta) {
+  VectorXf e;
+  MatrixXf J;
+  if (!residualesCSS(x, beta, e, &J)) return INFINITY;
+  float sse = e.squaredNorm();
+  float lambda = 1e-3f;
 
   for (int it = 0; it < MAX_ITER_LM; it++) {
-    double JtJ[(Q_MAX + 1) * (Q_MAX + 1)] = {0}, Jte[Q_MAX + 1] = {0};
-    float e[Q_MAX] = {0};                      // e(t-1-i)
-    float d[Q_MAX][Q_MAX + 1] = {{0}};         // d[i][j] = de(t-1-i)/dbeta_j
-    float thf[Q_MAX];
-    for (int i = 0; i < q; i++) thf[i] = (float)th[i];
+    const MatrixXf JtJ = J.transpose() * J;
+    const VectorXf Jte = J.transpose() * e;
 
-    for (int t = 0; t < n; t++) {
-      float pred = (float)mu;
-      for (int i = 0; i < q; i++) pred += thf[i] * e[i];
-      float et = x[t] - pred;
-
-      float dt[Q_MAX + 1];
-      for (int j = 0; j < k; j++) {
-        float s = (j == 0) ? -1.0f : -e[j - 1];
-        for (int i = 0; i < q; i++) s -= thf[i] * d[i][j];
-        dt[j] = s;
-      }
-      for (int r = 0; r < k; r++) {
-        Jte[r] += (double)dt[r] * et;
-        for (int c = r; c < k; c++) JtJ[r * k + c] += (double)dt[r] * dt[c];
-      }
-      for (int i = q - 1; i > 0; i--) {
-        e[i] = e[i - 1];
-        for (int j = 0; j < k; j++) d[i][j] = d[i - 1][j];
-      }
-      if (q > 0) {
-        e[0] = et;
-        for (int j = 0; j < k; j++) d[0][j] = dt[j];
-      }
-    }
-    for (int r = 0; r < k; r++)
-      for (int c = 0; c < r; c++) JtJ[r * k + c] = JtJ[c * k + r];
-
-    // Busca un paso que reduzca el SSE aumentando el amortiguamiento
     bool mejoro = false;
-    while (lambda < 1e8) {
-      double M[(Q_MAX + 1) * (Q_MAX + 1)], g[Q_MAX + 1];
-      memcpy(M, JtJ, sizeof(double) * k * k);
-      for (int r = 0; r < k; r++) { M[r * k + r] *= (1.0 + lambda); g[r] = -Jte[r]; }
-      if (resolverSistema(M, g, k)) {
-        double muN = mu + g[0], thN[Q_MAX];
-        for (int i = 0; i < q; i++) thN[i] = th[i] + g[i + 1];
-        double sseN = residualesCSS(x, n, q, muN, thN);
+    while (lambda < 1e8f) {
+      MatrixXf A = JtJ;
+      A.diagonal() *= (1.0f + lambda);
+      Eigen::LDLT<MatrixXf> ldlt(A);
+      if (ldlt.info() == Eigen::Success) {
+        const VectorXf betaN = beta - ldlt.solve(Jte);
+        const float sseN = sseCSS(x, betaN);
         if (sseN < sse) {
-          double mejora = (sse - sseN) / sse;
-          mu = muN;
-          memcpy(th, thN, sizeof(double) * q);
+          mejoro = (sse - sseN) / sse > 1e-6f;
+          beta = betaN;
           sse = sseN;
-          lambda = fmax(lambda * 0.1, 1e-9);
-          mejoro = mejora > 1e-9;
+          lambda = fmaxf(lambda * 0.1f, 1e-9f);
           break;
         }
       }
-      lambda *= 10.0;
+      lambda *= 10.0f;
     }
     if (!mejoro) break;
+    residualesCSS(x, beta, e, &J);                 // e y J en el nuevo punto
     yield();
   }
   return sse;
@@ -370,9 +330,6 @@ double ajustarCSS(const float* x, int n, int q, double& mu, double* th) {
 // ============================================================
 // MODELO MA(q) DE UNA VARIABLE (temperatura o humedad)
 // ============================================================
-float trabajoX[N_VALORES];     // copia lineal de la ventana (memoria de trabajo)
-float trabajoE[N_VALORES];     // residuales del AR largo (Hannan-Rissanen)
-
 struct ModeloMA {
   const char* nombre;
   const char* letra;     // "T" / "H"
@@ -382,15 +339,17 @@ struct ModeloMA {
   Serie serie;
 
   // Modelo seleccionado
-  bool   ok = false;
-  int    q = 0;
-  double mu = NAN, theta[Q_MAX] = {0}, sigma2 = NAN;
-  int    nAjuste = 0;
+  bool     ok = false;
+  int      q = 0;
+  float    mu = NAN;
+  VectorXf theta;                        // theta(0) = theta_1, ..., theta(q-1) = theta_q
+  double   sigma2 = NAN;
+  int      nAjuste = 0;
   Metricas ajuste;                       // residuales CSS en la ventana
-  double aic[Q_MAX + 1], bic[Q_MAX + 1]; // tabla de selección del orden
+  VectorXd aic, bic;                     // tabla de selección del orden (índice = q)
 
-  // Innovaciones recientes: eps[0] = e(t), eps[1] = e(t-1), ...
-  float eps[Q_MAX] = {0};
+  // Innovaciones recientes: eps(0) = e(t), eps(1) = e(t-1), ...
+  VectorXf eps;
 
   // Evaluación fuera de muestra a 1 paso
   float    predSig  = NAN;
@@ -404,20 +363,20 @@ struct ModeloMA {
 
   ModeloMA(const char* n, const char* l, const char* u, float lo_, float hi_)
     : nombre(n), letra(l), unidad(u), lo(lo_), hi(hi_) {
-    for (int i = 0; i <= Q_MAX; i++) aic[i] = bic[i] = NAN;
+    aic = bic = VectorXd::Constant(Q_MAX + 1, NAN);
+    eps = VectorXf::Zero(Q_MAX);
   }
 
   // X(t+h) = mu + sum_{i=h..q} theta_i e(t+h-i)   (h > q -> mu)
   float pronosticoCrudo(int h) const {
     if (!ok) return NAN;
-    double p = mu;
-    for (int i = h; i <= q; i++) p += theta[i - 1] * eps[i - h];
-    return (float)p;
+    if (h > q) return mu;
+    const int r = q - h + 1;                     // términos theta_h .. theta_q
+    return mu + theta.tail(r).dot(eps.head(r));
   }
   float pronostico(int h) const {
     float p = pronosticoCrudo(h);
-    if (!isnan(p)) { if (p < lo) p = lo; if (p > hi) p = hi; }
-    return p;
+    return isnan(p) ? p : fminf(fmaxf(p, lo), hi);   // límites físicos
   }
 
   float histRealAt(int i) const { return histReal[(histHead - histCount + i + 2 * GRAF_HIST) % GRAF_HIST]; }
@@ -436,10 +395,10 @@ struct ModeloMA {
     if (ok) {
       float e = x - pronosticoCrudo(1);
       if (!isfinite(e) || fabsf(e) > 1e3f) {     // recursión inestable: se reinicia
-        memset(eps, 0, sizeof(eps));
+        eps.setZero();
       } else {
-        for (int i = Q_MAX - 1; i > 0; i--) eps[i] = eps[i - 1];
-        eps[0] = e;
+        eps.tail(Q_MAX - 1) = eps.head(Q_MAX - 1).eval();   // desplaza
+        eps(0) = e;
       }
     }
 
@@ -450,7 +409,7 @@ struct ModeloMA {
   void reiniciar() {           // hueco largo: se conservan los parámetros
     serie.limpiar();
     histHead = histCount = 0;
-    memset(eps, 0, sizeof(eps));
+    eps.setZero();
     predSig = predEval = NAN;
   }
 
@@ -458,58 +417,58 @@ struct ModeloMA {
   void ajustar() {
     const int n = serie.count;
     if (n < N_MIN_AJUSTE) return;
-    for (int i = 0; i < n; i++) trabajoX[i] = serie.get(i);
+    const VectorXf x = serie.vector();
+    const float media = x.mean();
 
+    // Hannan-Rissanen, paso 1: residuales de un AR(m) largo (0 para t < m)
     const int m = (n > 10 * M_AR_HR) ? M_AR_HR : 2;
-    bool hrOk = residualesARLargo(trabajoX, n, m, trabajoE);
+    VectorXf ehat = VectorXf::Zero(n);
+    VectorXf a;
+    const MatrixXf Xar = matrizRezagos(x, m, m);
+    const bool hrOk = minimosCuadrados(Xar, x.tail(n - m), a);
+    if (hrOk) ehat.tail(n - m) = x.tail(n - m) - Xar * a;
 
-    double sumX = 0;
-    for (int i = 0; i < n; i++) sumX += trabajoX[i];
-    const double media = sumX / n;
-
-    int    mejorQ = -1;
-    double mejorMu = 0, mejorTh[Q_MAX] = {0}, mejorSSE = INFINITY;
+    int      mejorQ = -1;
+    VectorXf mejorBeta;
+    float    mejorSSE = INFINITY;
 
     for (int qq = 0; qq <= Q_MAX; qq++) {
-      double muI = media, thI[Q_MAX] = {0};
-      // Valores iniciales de Hannan-Rissanen (si fallan: mu = media, theta = 0)
-      if (qq > 0 && hrOk && !valoresInicialesHR(trabajoX, trabajoE, n, qq, m, muI, thI)) {
-        muI = media;
-        memset(thI, 0, sizeof(thI));
-      }
-      if (!isfinite(residualesCSS(trabajoX, n, qq, muI, thI))) {   // inicio no invertible
-        muI = media;
-        memset(thI, 0, sizeof(thI));
-      }
-      double sse = ajustarCSS(trabajoX, n, qq, muI, thI);
+      // Inicio por defecto: mu = media, theta = 0
+      VectorXf beta = VectorXf::Zero(qq + 1);
+      beta(0) = media;
+      // Hannan-Rissanen, paso 2 (si falla o no es invertible se usa el defecto)
+      VectorXf betaHR;
+      if (qq > 0 && hrOk && valoresInicialesHR(x, ehat, qq, m, betaHR) && isfinite(sseCSS(x, betaHR)))
+        beta = betaHR;
+
+      float sse = ajustarCSS(x, beta);
 
       if (isfinite(sse) && sse > 0) {
-        double s2 = sse / n;
-        double logL = -0.5 * n * (log(2.0 * M_PI * s2) + 1.0);
-        int    kPar = qq + 2;                      // mu, thetas y sigma2
-        aic[qq] = -2.0 * logL + 2.0 * kPar;
-        bic[qq] = -2.0 * logL + kPar * log((double)n);
-        if (mejorQ < 0 || aic[qq] < aic[mejorQ]) {
-          mejorQ = qq; mejorMu = muI; mejorSSE = sse;
-          memcpy(mejorTh, thI, sizeof(mejorTh));
+        criteriosInformacion(sse, n, qq + 2, aic(qq), bic(qq));   // k = mu, thetas y sigma2
+        if (mejorQ < 0 || aic(qq) < aic(mejorQ)) {
+          mejorQ = qq; mejorBeta = beta; mejorSSE = sse;
         }
       } else {
-        aic[qq] = bic[qq] = NAN;
+        aic(qq) = bic(qq) = NAN;
       }
       yield();
     }
     if (mejorQ < 0) return;
 
-    ok = true;
-    q = mejorQ;
-    mu = mejorMu;
-    memcpy(theta, mejorTh, sizeof(theta));
+    ok      = true;
+    q       = mejorQ;
+    mu      = mejorBeta(0);
+    theta   = mejorBeta.tail(q);
     nAjuste = n;
-    sigma2 = mejorSSE / n;
+    sigma2  = mejorSSE / n;
 
     // Residuales del modelo elegido e innovaciones actuales
+    VectorXf e;
+    residualesCSS(x, mejorBeta, e, nullptr);
     ajuste.limpiar();
-    residualesCSS(trabajoX, n, q, mu, theta, &ajuste, eps);
+    for (int t = 0; t < n; t++) ajuste.agregar(x(t), x(t) - e(t));
+    eps.setZero();
+    eps.head(q) = e.tail(q).reverse();          // eps(0) = e(t) más reciente
     predSig = pronostico(1);
   }
 };
@@ -694,8 +653,8 @@ void dibujarModelo(const ModeloMA& m) {
   display.printf("mu = %.4f\n", m.mu);
   // thetas en dos columnas (3 renglones para q <= 5)
   for (int i = 0; i < Q_MAX; i += 2) {
-    if (i < m.q) display.printf("t%d=%7.3f", i + 1, m.theta[i]);
-    if (i + 1 < m.q) display.printf(" t%d=%7.3f", i + 2, m.theta[i + 1]);
+    if (i < m.q) display.printf("t%d=%7.3f", i + 1, m.theta(i));
+    if (i + 1 < m.q) display.printf(" t%d=%7.3f", i + 2, m.theta(i + 1));
     display.print("\n");
   }
   if (m.q == 0) {
@@ -703,7 +662,7 @@ void dibujarModelo(const ModeloMA& m) {
     display.print("(sin thetas: X=mu+e)");
   }
   display.setCursor(0, 40);
-  display.printf("s2=%.4f AIC=%.0f\n", m.sigma2, m.aic[m.q]);
+  display.printf("s2=%.4f AIC=%.0f\n", m.sigma2, m.aic(m.q));
   fmt(s, sizeof(s), m.predSig, 2);
   display.printf("Pred +%dm: %s %s\n", INTERVALO_MIN, s, m.unidad);
   display.printf("Reajuste en %d min", max(0, REAJUSTE_MUESTRAS - muestrasDesdeAjuste) * INTERVALO_MIN);
@@ -777,8 +736,8 @@ void dibujarTablaAIC(const ModeloMA& m) {
   display.println("q        AIC      BIC");
   for (int qq = 0; qq <= Q_MAX; qq++) {
     char a[12], b[12];
-    fmt(a, sizeof(a), m.aic[qq], 1);
-    fmt(b, sizeof(b), m.bic[qq], 1);
+    fmt(a, sizeof(a), m.aic(qq), 1);
+    fmt(b, sizeof(b), m.bic(qq), 1);
     display.printf("%d%c%9s%9s\n", qq, (m.ok && qq == m.q) ? '*' : ' ', a, b);
   }
 }
@@ -848,11 +807,11 @@ void imprimirBloque(const ModeloMA& m) {
   Serial.printf("Modelo MA(%d) ajustado con n=%d  (reajuste en %d min)\n",
                 m.q, m.nAjuste, max(0, REAJUSTE_MUESTRAS - muestrasDesdeAjuste) * INTERVALO_MIN);
   Serial.printf("const (mu)       = %.6f\n", m.mu);
-  for (int i = 0; i < m.q; i++) Serial.printf("ma.L%d            = %.6f\n", i + 1, m.theta[i]);
+  for (int i = 0; i < m.q; i++) Serial.printf("ma.L%d            = %.6f\n", i + 1, m.theta(i));
   Serial.printf("sigma2           = %.6f\n", m.sigma2);
   Serial.println("  q          AIC          BIC");
   for (int qq = 0; qq <= Q_MAX; qq++)
-    Serial.printf("  %d %12.3f %12.3f%s\n", qq, m.aic[qq], m.bic[qq], qq == m.q ? "  <-" : "");
+    Serial.printf("  %d %12.3f %12.3f%s\n", qq, m.aic(qq), m.bic(qq), qq == m.q ? "  <-" : "");
   Serial.printf("Ajuste   RMSE=%.6f MAE=%.6f R2=%.6f\n", m.ajuste.rmse(), m.ajuste.mae(), m.ajuste.r2());
   Serial.printf("1 paso   pred usada=%.4f  RMSE=%.6f MAE=%.6f MAPE=%.4f%% R2=%.6f n=%lu\n",
                 m.predEval, m.unPaso.rmse(), m.unPaso.mae(), m.unPaso.mape(), m.unPaso.r2(),
@@ -909,8 +868,6 @@ void setup() {
   Serial.begin(115200);
   pinMode(PIN_BOTON, INPUT_PULLUP);
 
-  datosTelemetria.contador = 0;
-
   // -- INICIAR PANTALLA E I2C --
   Wire.begin(I2C_SDA, I2C_SCL);
   if (ENABLE_SCREEN && display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -950,12 +907,12 @@ void setup() {
   if (!sht31.begin(0x44)) Serial.println(F("Error: No se encontro el SHT3X."));
 
   // -- WIFI / NTP (solo si el RTC no tiene una hora válida) --
-  WiFi.mode(WIFI_STA);
   RtcDateTime now = Rtc.GetDateTime();
   RtcDateTime fechaReferencia(2026, 10, 01, 10, 0, 0);
 
   if (!now.IsValid() || now < fechaReferencia) {
     if (ENABLE_SCREEN) { display.println("Buscando WiFi..."); display.display(); }
+    WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
     int intentos = 0;
     while (WiFi.status() != WL_CONNECTED && intentos < 20) { delay(500); intentos++; }
@@ -968,8 +925,9 @@ void setup() {
                                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
         Rtc.SetDateTime(internetTime);
       }
-      WiFi.disconnect();
     }
+    WiFi.disconnect(true);   // el radio ya no se usa: se apaga
+    WiFi.mode(WIFI_OFF);
   }
 
   // -- PRECARGA DE LOS ÚLTIMOS N VALORES DESDE LA SD Y PRIMER AJUSTE --
@@ -978,16 +936,6 @@ void setup() {
     precargarDesdeSD();
     if (necesitaAjuste()) ajustarModelos();
   }
-
-  // -- INICIALIZAR ESP-NOW --
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error inicializando ESP-NOW");
-    return;
-  }
-  memcpy(peerInfo.peer_addr, macReceptor, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) Serial.println("Failed to add peer");
 }
 
 // ============================================================
@@ -1024,7 +972,7 @@ void loop() {
     }
 
     // ==========================================
-    // UNA MUESTRA CADA INTERVALO_MIN MINUTOS: MA(q), ESP-NOW y SD
+    // UNA MUESTRA CADA INTERVALO_MIN MINUTOS: MA(q) y SD
     // ==========================================
     if (now.IsValid() && !isnan(temperatura) && !isnan(humedad)) {
       uint32_t muestraAbs = now.TotalSeconds() / (60UL * INTERVALO_MIN);
@@ -1033,16 +981,7 @@ void loop() {
       //    si el intervalo ya estaba registrado (p. ej. por la precarga).
       if (registrarMuestra(muestraAbs, temperatura, humedad)) {
 
-        // 1. ESP-NOW y SD primero (no esperan a la re-estimación)
-        datosTelemetria.contador++;
-        datosTelemetria.uptime_ms = millis();
-        datosTelemetria.temperatura = temperatura;
-        datosTelemetria.humedad = humedad;
-        datosTelemetria.heap_libre = ESP.getFreeHeap();
-        datosTelemetria.estado = 0;
-        esp_err_t result = esp_now_send(macReceptor, (uint8_t*)&datosTelemetria, sizeof(datosTelemetria));
-        Serial.println(result == ESP_OK ? "-> ESP-NOW: Datos enviados con exito"
-                                        : "-> ESP-NOW: Error en el envío");
+        // 1. Serial y SD primero (no esperan a la re-estimación)
 
         Serial.printf(">>> TX: %02d/%02d/%04d,%02d:%02d:%02d,%.1f,%.0f\n",
                       now.Day(), now.Month(), now.Year(),
